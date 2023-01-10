@@ -86,7 +86,6 @@ use std::convert::From;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::panic::{catch_unwind, UnwindSafe};
-use core::ptr::null_mut;
 
 // We check that we can do this with the configure script and a couple of
 // static asserts. u64 and not usize to play nice with lowering to x86.
@@ -399,7 +398,7 @@ impl VALUE {
         unsafe { rb_obj_frozen_p(self) != VALUE(0) }
     }
 
-    pub fn shape_of(self) -> Option<Shape> {
+    pub fn shape_of(self) -> Option<ShapeGuard> {
         Shape::of(self)
     }
 
@@ -699,4 +698,4 @@ mod manual_defs {
 }
 pub use manual_defs::*;
 
-use crate::ruby::Shape;
+use crate::ruby::{Shape, ShapeGuard};

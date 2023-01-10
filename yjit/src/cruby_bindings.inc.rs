@@ -296,6 +296,17 @@ pub struct rb_shape {
     pub parent_id: shape_id_t,
 }
 pub type rb_shape_t = rb_shape;
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum shape_type {
+    SHAPE_ROOT = 0,
+    SHAPE_IVAR = 1,
+    SHAPE_FROZEN = 2,
+    SHAPE_CAPACITY_CHANGE = 3,
+    SHAPE_INITIAL_CAPACITY = 4,
+    SHAPE_T_OBJECT = 5,
+    SHAPE_OBJ_TOO_COMPLEX = 6,
+}
 pub const idDot2: ruby_method_ids = 128;
 pub const idDot3: ruby_method_ids = 129;
 pub const idUPlus: ruby_method_ids = 132;

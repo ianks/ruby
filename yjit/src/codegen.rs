@@ -8,6 +8,7 @@ use crate::cruby::*;
 use crate::invariants::*;
 use crate::options::*;
 use crate::ruby::Shape;
+use crate::ruby::ShapeGuard;
 use crate::stats::*;
 use crate::utils::*;
 use CodegenStatus::*;
@@ -1964,15 +1965,14 @@ fn gen_get_ivar(
     recv_opnd: YARVOpnd,
     side_exit: CodePtr,
 ) -> CodegenStatus {
-    let shape = match comptime_receiver.shape_of() {
-        Some(s) => s,
-        None => return CantCompile,
-    };
+    let shape = match comptime_receiver.shape_of().expect("comptime_receiver must have a shape") {
+        ShapeGuard::ObjTooComplex(_) => {
+            // If the shape is too complex, we can't do anything
+            return KeepCompiling;
+        },
 
-    // If the object has a too complex shape, we exit
-    if shape.is_too_complex() {
-        return CantCompile;
-    }
+       guard => guard.value(),
+    };
 
     let comptime_val_klass = comptime_receiver.class_of();
     let starting_context = ctx.clone(); // make a copy for use with jit_chain_guard
@@ -2191,14 +2191,13 @@ fn gen_setinstancevariable(
     let ivar_name = jit_get_arg(jit, 0).as_u64();
     let comptime_receiver = jit_peek_at_self(jit);
     let comptime_val_klass = comptime_receiver.class_of();
-    let mut shape = comptime_receiver.shape_of().expect("shape is missing");
+    let mut shape = match comptime_receiver.shape_of().expect("shape_of() failed") {
+        // If the comptime receiver is frozen, writing an IV will raise an exception
+        // and we don't want to JIT code to deal with that situation.
+        ShapeGuard::Frozen(_) | ShapeGuard::ObjTooComplex(_) => return CantCompile,
+        guard => guard.value(),
+    };
 
-    // If the comptime receiver is frozen, writing an IV will raise an exception
-    // and we don't want to JIT code to deal with that situation.
-    // If the object has a too complex shape, we will also exit
-    if comptime_receiver.is_frozen() || shape.is_too_complex() {
-        return CantCompile;
-    }
 
     let (_, stack_type) = ctx.get_opnd_mapping(StackOpnd(0));
 
@@ -2298,14 +2297,14 @@ fn gen_setinstancevariable(
                     &mut shape
                 };
 
-                let dest_shape = capa_shape.get_next(comptime_receiver, ivar_name).expect("get_next must not be None");
+                let dest_shape = match capa_shape.get_next(comptime_receiver, ivar_name).expect("get_next must not be None") {
+                    ShapeGuard::ObjTooComplex(_) => return CantCompile,
+                    ShapeGuard::Frozen(shape) => shape, // Is this right?
+                    shape => shape.value(),
+                };
 
 
                 let new_shape_id = dest_shape.id();
-
-                if new_shape_id == OBJ_TOO_COMPLEX_SHAPE_ID {
-                    return CantCompile;
-                }
 
                 if shape.needs_extension() {
                     // Generate the C call so that runtime code will increase
