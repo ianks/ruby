@@ -86,6 +86,7 @@ use std::convert::From;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::panic::{catch_unwind, UnwindSafe};
+use core::ptr::null_mut;
 
 // We check that we can do this with the configure script and a couple of
 // static asserts. u64 and not usize to play nice with lowering to x86.
@@ -398,24 +399,8 @@ impl VALUE {
         unsafe { rb_obj_frozen_p(self) != VALUE(0) }
     }
 
-    pub fn shape_too_complex(self) -> bool {
-        unsafe { rb_shape_obj_too_complex(self) }
-    }
-
-    pub fn shape_id_of(self) -> u32 {
-        unsafe { rb_shape_get_shape_id(self) }
-    }
-
-    pub fn shape_of(self) -> *mut rb_shape {
-        unsafe {
-            let shape = rb_shape_get_shape_by_id(self.shape_id_of());
-
-            if shape.is_null() {
-                panic!("Shape should not be null");
-            } else {
-                shape
-            }
-        }
+    pub fn shape_of(self) -> Option<Shape> {
+        Shape::of(self)
     }
 
     pub fn embedded_p(self) -> bool {
@@ -713,3 +698,5 @@ mod manual_defs {
     pub const RUBY_OFFSET_ICE_VALUE: i32 = 8;
 }
 pub use manual_defs::*;
+
+use crate::ruby::Shape;

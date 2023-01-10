@@ -7,6 +7,7 @@ use crate::core::*;
 use crate::cruby::*;
 use crate::invariants::*;
 use crate::options::*;
+use crate::ruby::Shape;
 use crate::stats::*;
 use crate::utils::*;
 use CodegenStatus::*;
@@ -1963,8 +1964,13 @@ fn gen_get_ivar(
     recv_opnd: YARVOpnd,
     side_exit: CodePtr,
 ) -> CodegenStatus {
+    let shape = match comptime_receiver.shape_of() {
+        Some(s) => s,
+        None => return CantCompile,
+    };
+
     // If the object has a too complex shape, we exit
-    if comptime_receiver.shape_too_complex() {
+    if shape.is_too_complex() {
         return CantCompile;
     }
 
@@ -2017,16 +2023,7 @@ fn gen_get_ivar(
         return EndBlock;
     }
 
-    let ivar_index = unsafe {
-        let shape_id = comptime_receiver.shape_id_of();
-        let shape = rb_shape_get_shape_by_id(shape_id);
-        let mut ivar_index: u32 = 0;
-        if rb_shape_get_iv_index(shape, ivar_name, &mut ivar_index) {
-            Some(ivar_index as usize)
-        } else {
-            None
-        }
-    };
+    let ivar_index = shape.get_iv_index(ivar_name);
 
     // must be before stack_pop
     let recv_type = ctx.get_opnd_type(recv_opnd);
@@ -2049,8 +2046,8 @@ fn gen_get_ivar(
     // Compile time self is embedded and the ivar index lands within the object
     let embed_test_result = unsafe { FL_TEST_RAW(comptime_receiver, VALUE(ROBJECT_EMBED.as_usize())) != VALUE(0) };
 
-    let expected_shape = unsafe { rb_shape_get_shape_id(comptime_receiver) };
-    let shape_id_offset = unsafe { rb_shape_id_offset() };
+    let expected_shape = shape.id();
+    let shape_id_offset = Shape::id_offset();
     let shape_opnd = Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_id_offset);
 
     asm.comment("guard shape");
@@ -2079,7 +2076,7 @@ fn gen_get_ivar(
                 // See ROBJECT_IVPTR() from include/ruby/internal/core/robject.h
 
                 // Load the variable
-                let offs = ROBJECT_OFFSET_AS_ARY + (ivar_index * SIZEOF_VALUE) as i32;
+                let offs = ROBJECT_OFFSET_AS_ARY + (ivar_index.as_usize() * SIZEOF_VALUE) as i32;
                 let ivar_opnd = Opnd::mem(64, recv, offs);
 
                 // Push the ivar on the stack
@@ -2092,7 +2089,7 @@ fn gen_get_ivar(
                 let tbl_opnd = asm.load(Opnd::mem(64, recv, ROBJECT_OFFSET_AS_HEAP_IVPTR));
 
                 // Read the ivar from the extended table
-                let ivar_opnd = Opnd::mem(64, tbl_opnd, (SIZEOF_VALUE * ivar_index) as i32);
+                let ivar_opnd = Opnd::mem(64, tbl_opnd, (SIZEOF_VALUE * ivar_index.as_usize()) as i32);
 
                 let out_opnd = ctx.stack_push(Type::Unknown);
                 asm.mov(out_opnd, ivar_opnd);
@@ -2194,11 +2191,12 @@ fn gen_setinstancevariable(
     let ivar_name = jit_get_arg(jit, 0).as_u64();
     let comptime_receiver = jit_peek_at_self(jit);
     let comptime_val_klass = comptime_receiver.class_of();
+    let mut shape = comptime_receiver.shape_of().expect("shape is missing");
 
     // If the comptime receiver is frozen, writing an IV will raise an exception
     // and we don't want to JIT code to deal with that situation.
     // If the object has a too complex shape, we will also exit
-    if comptime_receiver.is_frozen() || comptime_receiver.shape_too_complex() {
+    if comptime_receiver.is_frozen() || shape.is_too_complex() {
         return CantCompile;
     }
 
@@ -2244,16 +2242,7 @@ fn gen_setinstancevariable(
         );
     } else {
         // Get the iv index
-        let ivar_index = unsafe {
-            let shape_id = comptime_receiver.shape_id_of();
-            let shape = rb_shape_get_shape_by_id(shape_id);
-            let mut ivar_index: u32 = 0;
-            if rb_shape_get_iv_index(shape, ivar_name, &mut ivar_index) {
-                Some(ivar_index as usize)
-            } else {
-                None
-            }
-        };
+        let ivar_index = shape.get_iv_index(ivar_name);
 
         // Get the receiver
         let mut recv = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF));
@@ -2270,12 +2259,10 @@ fn gen_setinstancevariable(
             guard_object_is_heap(asm, recv, side_exit);
         }
 
-        let expected_shape = unsafe { rb_shape_get_shape_id(comptime_receiver) };
-        let shape_id_offset = unsafe { rb_shape_id_offset() };
-        let shape_opnd = Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_id_offset);
+        let shape_opnd = Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, Shape::id_offset());
 
         asm.comment("guard shape");
-        asm.cmp(shape_opnd, Opnd::UImm(expected_shape as u64));
+        asm.cmp(shape_opnd, Opnd::UImm(shape.id() as u64));
         let megamorphic_side_exit = counted_exit!(ocb, side_exit, setivar_megamorphic).into();
         jit_chain_guard(
             JCC_JNE,
@@ -2293,40 +2280,34 @@ fn gen_setinstancevariable(
             // If we don't have an instance variable index, then we need to
             // transition out of the current shape.
             None => {
-                let shape = comptime_receiver.shape_of();
-
-                let current_capacity = unsafe { (*shape).capacity };
+                let current_capacity = shape.capacity();
                 let new_capacity = current_capacity * 2;
+
+
+                // We can write to the object, but we need to transition the shape
+                let ivar_index = shape.next_iv_index() as usize;
 
                 // If the object doesn't have the capacity to store the IV,
                 // then we'll need to allocate it.
-                let needs_extension = unsafe { (*shape).next_iv_index >= current_capacity };
-
-                // We can write to the object, but we need to transition the shape
-                let ivar_index = unsafe { (*shape).next_iv_index } as usize;
-
-                let capa_shape = if needs_extension {
+                let capa_shape = if shape.needs_extension() {
                     // We need to add an extended table to the object
                     // First, create an outgoing transition that increases the
                     // capacity
-                    Some(unsafe { rb_shape_transition_shape_capa(shape, new_capacity) })
+                    shape.transition_capacity(new_capacity)
                 } else {
-                    None
+                    &mut shape
                 };
 
-                let dest_shape = if capa_shape.is_none() {
-                    unsafe { rb_shape_get_next(shape, comptime_receiver, ivar_name) }
-                } else {
-                    unsafe { rb_shape_get_next(capa_shape.unwrap(), comptime_receiver, ivar_name) }
-                };
+                let dest_shape = capa_shape.get_next(comptime_receiver, ivar_name).expect("get_next must not be None");
 
-                let new_shape_id = unsafe { rb_shape_id(dest_shape) };
+
+                let new_shape_id = dest_shape.id();
 
                 if new_shape_id == OBJ_TOO_COMPLEX_SHAPE_ID {
                     return CantCompile;
                 }
 
-                if needs_extension {
+                if shape.needs_extension() {
                     // Generate the C call so that runtime code will increase
                     // the capacity and set the buffer.
                     asm.ccall(rb_ensure_iv_list_size as *const u8,
@@ -2342,11 +2323,11 @@ fn gen_setinstancevariable(
                 }
 
                 write_val = ctx.stack_pop(1);
-                gen_write_iv(asm, comptime_receiver, recv, ivar_index, write_val, needs_extension);
+                gen_write_iv(asm, comptime_receiver, recv, ivar_index, write_val, shape.needs_extension());
 
                 asm.comment("write shape");
 
-                let shape_id_offset = unsafe { rb_shape_id_offset() };
+                let shape_id_offset = Shape::id_offset();
                 let shape_opnd = Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_id_offset);
 
                 // Store the new shape
@@ -2360,7 +2341,7 @@ fn gen_setinstancevariable(
                 // made the transition already, then there's no reason to
                 // update the shape on the object.  Just set the IV.
                 write_val = ctx.stack_pop(1);
-                gen_write_iv(asm, comptime_receiver, recv, ivar_index, write_val, false);
+                gen_write_iv(asm, comptime_receiver, recv, ivar_index.as_usize(), write_val, false);
             },
         }
 
