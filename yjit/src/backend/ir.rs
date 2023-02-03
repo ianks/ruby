@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 
 use std::cell::Cell;
-use std::fmt;
+use std::{fmt, ptr};
 use std::convert::From;
 use std::io::Write;
 use std::mem::take;
@@ -125,6 +125,11 @@ impl Opnd
     /// Constructor for constant pointer operand
     pub fn const_ptr(ptr: *const u8) -> Self {
         Opnd::UImm(ptr as u64)
+    }
+
+    /// Constructor for a null pointer
+    pub fn null_ptr() -> Self {
+        Self::const_ptr(ptr::null())
     }
 
     pub fn is_some(&self) -> bool {

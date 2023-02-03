@@ -1132,6 +1132,11 @@ fn gen_opt_plus(
     }
 }
 
+// YARV::newarray(4)
+// 0
+// 1
+// 2
+// 3
 // new array initialized from top N values
 fn gen_newarray(
     jit: &mut JITState,
@@ -5070,6 +5075,8 @@ fn gen_send_iseq(
     argc: i32,
     captured_opnd: Option<Opnd>,
 ) -> CodegenStatus {
+    let location = iseq_get_location(jit.get_iseq(), jit.get_insn_idx());
+
     let mut argc = argc;
 
     // Create a side-exit to fall back to the interpreter
@@ -5091,10 +5098,10 @@ fn gen_send_iseq(
 
     // No support for callees with these parameters yet as they require allocation
     // or complex handling.
-    if unsafe { get_iseq_flags_has_rest(iseq) } {
-        gen_counter_incr!(asm, send_iseq_has_rest);
-        return CantCompile;
-    }
+    // if unsafe { get_iseq_flags_has_rest(iseq) } {
+    //     gen_counter_incr!(asm, send_iseq_has_rest);
+    //     return CantCompile;
+    // }
     if unsafe { get_iseq_flags_has_post(iseq) } {
         gen_counter_incr!(asm, send_iseq_has_post);
         return CantCompile;
@@ -5185,10 +5192,44 @@ fn gen_send_iseq(
         return CantCompile;
     }
 
-    if opts_filled > opt_num {
+    let has_rest_arg = unsafe { get_iseq_flags_has_rest(iseq) };
+
+    if opts_filled > opt_num && !has_rest_arg {
         // Too many arguments
         gen_counter_incr!(asm, send_iseq_arity_error);
         return CantCompile;
+    }
+
+    if has_rest_arg {
+        let n = (argc - required_num) as u32; // this is definitely right 100% of the time
+        argc = required_num + 1;
+
+        // Save the PC and SP because we are allocating
+        // jit_prepare_routine_call(jit, ctx, asm);
+
+        // If n is 0, then elts is never going to be read, so we can just pass null
+        let values_ptr = if n == 0 {
+            Opnd::UImm(0)
+        } else {
+            asm.comment("load pointer to array elts");
+            let offset_magnitude = (SIZEOF_VALUE as u32) * n;
+            let values_opnd = ctx.sp_opnd(-(offset_magnitude as isize));
+            asm.lea(values_opnd)
+        };
+
+        // call rb_ec_ary_new_from_values(struct rb_execution_context_struct *ec, long n, const VALUE *elts);
+        let new_ary = asm.ccall(
+            rb_ec_ary_new_from_values as *const u8,
+            vec![
+                EC,
+                Opnd::UImm(n.into()),
+                values_ptr
+            ]
+        );
+
+        ctx.stack_pop(n.as_usize());
+        let stack_ret = ctx.stack_push(Type::CArray);
+        asm.mov(stack_ret, new_ary);
     }
 
     let block_arg = flags & VM_CALL_ARGS_BLOCKARG != 0;
@@ -7248,6 +7289,12 @@ fn gen_opt_invokebuiltin_delegate(
 
     KeepCompiling
 }
+
+/// Parse Ruby text
+/// Turn to YARV
+/// Make it machine code
+/// Make memory executable
+/// Do it
 
 /// Maps a YARV opcode to a code generation function (if supported)
 fn get_gen_fn(opcode: VALUE) -> Option<InsnGenFn> {
