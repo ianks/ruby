@@ -49,6 +49,14 @@ int ruby_vm_destruct(ruby_vm_t *vm);
  */
 void ruby_vm_at_exit(void(*func)(ruby_vm_t *));
 
+/**
+ * ruby_global_vm_available_p returns a boolean indicating if there is a global
+ * VM available.  This function is intended to be used by extension libraries to
+ * check if they are running in a VM or not, since certain APIs (e.g.
+ * rb_gc_adjust_memory_usage) are not safe to be called outside of a VM.
+ */
+bool ruby_global_vm_available_p(void);
+
 RBIMPL_SYMBOL_EXPORT_END()
 
 #endif /* RUBY_VM_H */

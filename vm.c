@@ -4406,4 +4406,10 @@ rb_vm_empty_cc_for_super(void)
     return &vm_empty_cc_for_super;
 }
 
+bool
+ruby_global_vm_available_p(void)
+{
+    return rb_current_vm() != NULL && rb_current_execution_context(true) != NULL;
+}
+
 #include "vm_call_iseq_optimized.inc" /* required from vm_insnhelper.c */
