@@ -995,10 +995,14 @@ impl IseqPayload {
 
 /// Get the payload for an iseq. For safety it's up to the caller to ensure the returned `&mut`
 /// upholds aliasing rules and that the argument is a valid iseq.
-pub fn get_iseq_payload(iseq: IseqPtr) -> Option<&'static mut IseqPayload> {
+pub fn get_iseq_payload<'a>(iseq: IseqPtr) -> Option<UnsafeCell<&'a mut IseqPayload>> {
     let payload = unsafe { rb_iseq_get_yjit_payload(iseq) };
     let payload: *mut IseqPayload = payload.cast();
-    unsafe { payload.as_mut() }
+    if payload.is_null() {
+        None
+    } else {
+        Some(UnsafeCell::new(unsafe { &mut *payload }))
+    }
 }
 
 /// Get the payload object associated with an iseq. Create one if none exists.
@@ -1036,7 +1040,8 @@ pub fn get_or_create_iseq_payload(iseq: IseqPtr) -> &'static mut IseqPayload {
 pub fn for_each_iseq<F: FnMut(IseqPtr)>(mut callback: F) {
     unsafe extern "C" fn callback_wrapper(iseq: IseqPtr, data: *mut c_void) {
         // SAFETY: points to the local below
-        let callback: &mut &mut dyn FnMut(IseqPtr) -> bool = unsafe { std::mem::transmute(&mut *data) };
+        let callback: &mut &mut dyn FnMut(IseqPtr) -> bool =
+            unsafe { std::mem::transmute(&mut *data) };
         callback(iseq);
     }
     let mut data: &mut dyn FnMut(IseqPtr) = &mut callback;
@@ -1044,7 +1049,7 @@ pub fn for_each_iseq<F: FnMut(IseqPtr)>(mut callback: F) {
 }
 
 /// Iterate over all ISEQ payloads
-pub fn for_each_iseq_payload<F: FnMut(&IseqPayload)>(mut callback: F) {
+pub fn for_each_iseq_payload<F: FnMut(UnsafeCell<&mut IseqPayload>)>(mut callback: F) {
     for_each_iseq(|iseq| {
         if let Some(iseq_payload) = get_iseq_payload(iseq) {
             callback(iseq_payload);
@@ -1064,7 +1069,7 @@ pub fn for_each_on_stack_iseq<F: FnMut(IseqPtr)>(mut callback: F) {
 }
 
 /// Iterate over all on-stack ISEQ payloads
-pub fn for_each_on_stack_iseq_payload<F: FnMut(&IseqPayload)>(mut callback: F) {
+pub fn for_each_on_stack_iseq_payload<F: FnMut(UnsafeCell<&mut IseqPayload>)>(mut callback: F) {
     for_each_on_stack_iseq(|iseq| {
         if let Some(iseq_payload) = get_iseq_payload(iseq) {
             callback(iseq_payload);
@@ -1073,7 +1078,7 @@ pub fn for_each_on_stack_iseq_payload<F: FnMut(&IseqPayload)>(mut callback: F) {
 }
 
 /// Iterate over all NOT on-stack ISEQ payloads
-pub fn for_each_off_stack_iseq_payload<F: FnMut(&mut IseqPayload)>(mut callback: F) {
+pub fn for_each_off_stack_iseq_payload<F: FnMut(UnsafeCell<&mut IseqPayload>)>(mut callback: F) {
     let mut on_stack_iseqs: Vec<IseqPtr> = vec![];
     for_each_on_stack_iseq(|iseq| {
         on_stack_iseqs.push(iseq);
@@ -1282,11 +1287,13 @@ pub extern "C" fn rb_yjit_iseq_update_references(payload: *mut c_void) {
 /// Get all blocks for a particular place in an iseq.
 fn get_version_list(blockid: BlockId) -> Option<&'static mut VersionList> {
     let insn_idx = blockid.idx.as_usize();
-    match get_iseq_payload(blockid.iseq) {
-        Some(payload) if insn_idx < payload.version_map.len() => {
-            Some(payload.version_map.get_mut(insn_idx).unwrap())
-        },
-        _ => None
+    let payload = get_iseq_payload(blockid.iseq)?;
+    let payload = unsafe { &mut *payload.get() };
+
+    if insn_idx < payload.version_map.len() {
+        payload.version_map.get_mut(insn_idx)
+    } else {
+        None
     }
 }
 
@@ -1308,27 +1315,28 @@ fn get_or_create_version_list(blockid: BlockId) -> &'static mut VersionList {
 /// Take all of the blocks for a particular place in an iseq
 pub fn take_version_list(blockid: BlockId) -> VersionList {
     let insn_idx = blockid.idx.as_usize();
-    match get_iseq_payload(blockid.iseq) {
-        Some(payload) if insn_idx < payload.version_map.len() => {
-            mem::take(&mut payload.version_map[insn_idx])
-        },
-        _ => VersionList::default(),
+    let Some(payload) = get_iseq_payload(blockid.iseq) else {
+        return VersionList::default();
+    };
+    let payload = unsafe { &mut *payload.get() };
+
+    if let Some(versions) = payload.version_map.get_mut(insn_idx) {
+        mem::take(versions)
+    } else {
+        VersionList::default()
     }
 }
 
 /// Count the number of block versions matching a given blockid
 fn get_num_versions(blockid: BlockId) -> usize {
     let insn_idx = blockid.idx.as_usize();
-    match get_iseq_payload(blockid.iseq) {
-        Some(payload) => {
-            payload
-                .version_map
-                .get(insn_idx)
-                .map(|versions| versions.len())
-                .unwrap_or(0)
-        }
-        None => 0,
-    }
+    let Some(payload) = get_iseq_payload(blockid.iseq) else {
+        return 0;
+    };
+    let payload = unsafe { &*payload.get() };
+    let version_map = &payload.version_map.get(insn_idx);
+
+    version_map.map(|versions| versions.len()).unwrap_or(0)
 }
 
 /// Get or create a list of block versions generated for an iseq
@@ -1471,9 +1479,12 @@ unsafe fn add_block_version(blockref: BlockRef, cb: &CodeBlock) {
     incr_counter!(compiled_block_count);
 
     // Mark code pages for code GC
-    let iseq_payload = get_iseq_payload(block.iseq.get()).unwrap();
-    for page in cb.addrs_to_pages(block.start_addr, block.end_addr.get()) {
-        iseq_payload.pages.insert(page);
+    let iseq_payload = get_iseq_payload(block.iseq.get());
+    if let Some(iseq_payload) = iseq_payload {
+        let iseq_payload = unsafe { &mut *iseq_payload.get() };
+        for page in cb.addrs_to_pages(block.start_addr, block.end_addr.get()) {
+            iseq_payload.pages.insert(page);
+        }
     }
 }
 
@@ -3148,7 +3159,11 @@ pub fn invalidate_block_version(blockref: &BlockRef) {
 pub fn delayed_deallocation(blockref: BlockRef) {
     block_assumptions_free(blockref);
 
-    let payload = get_iseq_payload(unsafe { blockref.as_ref() }.iseq.get()).unwrap();
+    let Some(payload) = get_iseq_payload(unsafe { blockref.as_ref() }.iseq.get()) else {
+        return;
+    };
+    let payload = unsafe { &mut *payload.get() };
+
     payload.dead_blocks.push(blockref);
 }
 
