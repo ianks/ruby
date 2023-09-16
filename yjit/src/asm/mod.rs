@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::mem;
 use std::rc::Rc;
-use crate::core::IseqPayload;
 use crate::core::for_each_off_stack_iseq_payload;
 use crate::core::for_each_on_stack_iseq_payload;
 use crate::invariants::rb_yjit_tracing_invalidate_all;
