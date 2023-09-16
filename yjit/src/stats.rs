@@ -688,13 +688,13 @@ fn rb_yjit_gen_stats_dict(context: bool) -> VALUE {
 fn get_live_context_count() -> usize {
     let mut count = 0;
     for_each_iseq_payload(|iseq_payload| {
-        for blocks in iseq_payload.version_map.iter() {
+        let payload = unsafe { &mut *iseq_payload.get() };
+        for blocks in payload.version_map.iter() {
             for block in blocks.iter() {
-                count += unsafe { block.as_ref() }.get_ctx_count();
+                if !block.as_ptr().is_null() {
+                    count += unsafe { block.as_ref() }.get_ctx_count();
+                }
             }
-        }
-        for block in iseq_payload.dead_blocks.iter() {
-            count += unsafe { block.as_ref() }.get_ctx_count();
         }
     });
     count

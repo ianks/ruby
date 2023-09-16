@@ -487,6 +487,7 @@ pub extern "C" fn rb_yjit_tracing_invalidate_all() {
         });
         for_each_iseq(|iseq| {
             if let Some(payload) = get_iseq_payload(iseq) {
+                let payload = unsafe { &mut *payload.get() };
                 let blocks = payload.take_all_blocks();
 
                 if on_stack_iseqs.contains(&iseq) {
