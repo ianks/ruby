@@ -1038,6 +1038,14 @@ ractor_moved_missing(int argc, VALUE *argv, VALUE self)
  *
  */
 
+// Move-opt level + pre-flight counters. Declared here (above the accessors and
+// Init_Ractor, which read them) so every use is after the definition. The env
+// var selects which gate runs; the counters prove at runtime which scan path
+// executed. See obj_data_refs_ok_p below for the level semantics.
+static int ractor_move_opt = 0;
+static size_t ractor_refscan_count = 0;        // plain (relocking) scans run
+static size_t ractor_refscan_locked_count = 0; // cheapened (no-relock) scans run
+
 // === Pre-flight accessors (patched-binary liveness + per-path counters) ===
 // These exist only on the patched build, so Ractor.respond_to?(:__refscan_count)
 // is a hard proof that the move-opt fork is the running binary.
@@ -1798,12 +1806,9 @@ obj_traverse_replace_rec(struct obj_traverse_replace_data *data)
 //     it holds is permanently shareable; trust it and skip the scan entirely.
 //
 // All four levels are compiled into one binary; the env var only selects which
-// gate runs, so YJIT codegen is identical across runs. The two counters below
-// are pre-flight instrumentation: they prove at runtime that the patched binary
-// is live and which scan path actually executed for a given level.
-static int ractor_move_opt = 0;
-static size_t ractor_refscan_count = 0;        // plain (relocking) scans run
-static size_t ractor_refscan_locked_count = 0; // cheapened (no-relock) scans run
+// gate runs, so YJIT codegen is identical across runs. The counters
+// (ractor_refscan_count / ractor_refscan_locked_count) and ractor_move_opt are
+// declared near the pre-flight accessors above.
 
 static void
 obj_refer_only_shareables_p_i(VALUE obj, void *ptr)
