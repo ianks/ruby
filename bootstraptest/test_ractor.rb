@@ -2128,6 +2128,53 @@ assert_equal 'ok', %q{
   ractor.value
 }
 
+# A RUBY_TYPED_FROZEN_SHAREABLE T_DATA (Time) may move, preserving its value.
+assert_equal 'ok', %q{
+  ractor = Ractor.new do
+    t = Ractor.receive
+    t.is_a?(Time) && t.to_i == 1234 ? :ok : [t.class, t.to_i]
+  end
+  ractor.send(Time.at(1234).utc, move: true)
+  ractor.value
+}
+
+# Moving a frozen-shareable T_DATA tombstones the original in the sender.
+assert_equal 'ok', %q{
+  src = Time.at(42).utc
+  ractor = Ractor.new { Ractor.receive }
+  ractor.send(src, move: true)
+  begin
+    src.to_i
+    :fail
+  rescue Ractor::MovedError
+    :ok
+  end
+}
+
+# Aliasing is preserved when a frozen-shareable T_DATA is reachable many ways.
+assert_equal 'ok', %q{
+  ractor = Ractor.new do
+    obj  = Ractor.receive
+    refs = [obj[:a], obj[:arr][0], obj[:arr][1]]
+    moved = refs.any? { |x| Ractor::MovedObject === x }
+    !moved && refs.all? { |x| x.equal?(refs[0]) } ? :ok : [moved]
+  end
+  t = Time.at(7).utc
+  ractor.send({ a: t, arr: [t, t] }, move: true)
+  ractor.value
+}
+
+# A non-shareable T_DATA (Mutex) still refuses to move.
+assert_equal 'ok', %q{
+  ractor = Ractor.new { Ractor.receive }
+  begin
+    ractor.send(Thread::Mutex.new, move: true)
+    :fail
+  rescue Ractor::Error => e
+    e.message.include?("can not move") ? :ok : e.message
+  end
+}
+
 # moved arrays can't be used
 assert_equal 'ok', %q{
   ractor = Ractor.new { Ractor.receive }

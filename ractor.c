@@ -1947,7 +1947,20 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
         break;
 
       case T_DATA:
-        if (!data->move && obj_refer_only_shareables_p(obj)) {
+        // A T_DATA crosses by value only when every Ruby object it references is
+        // itself shareable, since those refs are not traversed or replaced below
+        // and must be valid in the destination as-is.
+        //
+        // Copy clones the wrapper (copy_enter calls #clone) and is allowed for any
+        // such T_DATA. Move has no clone step: move_leave memcpy's the slot, so the
+        // wrapped C data must survive a raw relocation. We permit that only for
+        // RUBY_TYPED_FROZEN_SHAREABLE types. A type that already declares a frozen
+        // instance safe to share by reference across ractors is safe to hand to a
+        // single ractor by exclusive ownership. Embedded data (Time) is duplicated
+        // by the memcpy; pointer-backed data (BigDecimal) transfers ownership, and
+        // the tombstoned original never runs dfree, so its C struct is freed once.
+        if (obj_refer_only_shareables_p(obj) &&
+            (!data->move || allow_frozen_shareable_p(obj))) {
             break;
         }
         else {
