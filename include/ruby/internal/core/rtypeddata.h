@@ -210,7 +210,17 @@ rbimpl_typeddata_flags {
      * using the dmark/dcompact callback functions or whether we should mark
      * declaratively using a list of references defined inside the data struct we're wrapping
      */
-    RUBY_TYPED_DECL_MARKING     = RUBY_FL_USER2
+    RUBY_TYPED_DECL_MARKING     = RUBY_FL_USER2,
+
+    /**
+     * The type author asserts that every Ruby object this T_DATA references is
+     * permanently shareable (e.g. frozen Integer/Float/Bignum, frozen String,
+     * nil). When set, the Ractor move/copy path trusts the assertion and skips
+     * the per-instance reachability scan that would otherwise re-prove it. Same
+     * trust model as RUBY_TYPED_FROZEN_SHAREABLE. Read-only metadata: it changes
+     * no marking, freeing, write-barrier, or GC behavior.
+     */
+    RUBY_TYPED_ONLY_SHAREABLE_REFS = RUBY_FL_USER3
 };
 
 /**

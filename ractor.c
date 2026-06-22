@@ -1038,11 +1038,49 @@ ractor_moved_missing(int argc, VALUE *argv, VALUE self)
  *
  */
 
+// === Pre-flight accessors (patched-binary liveness + per-path counters) ===
+// These exist only on the patched build, so Ractor.respond_to?(:__refscan_count)
+// is a hard proof that the move-opt fork is the running binary.
+static VALUE
+ractor_s_move_opt_level(VALUE self)
+{
+    return INT2FIX(ractor_move_opt);
+}
+
+static VALUE
+ractor_s_refscan_count(VALUE self)
+{
+    return SIZET2NUM(ractor_refscan_count);
+}
+
+static VALUE
+ractor_s_refscan_locked_count(VALUE self)
+{
+    return SIZET2NUM(ractor_refscan_locked_count);
+}
+
+static VALUE
+ractor_s_refscan_reset(VALUE self)
+{
+    ractor_refscan_count = 0;
+    ractor_refscan_locked_count = 0;
+    return Qnil;
+}
+
 void
 Init_Ractor(void)
 {
     rb_cRactor = rb_define_class("Ractor", rb_cObject);
     rb_undef_alloc_func(rb_cRactor);
+
+    {
+        const char *opt = getenv("RACTOR_MOVE_OPT");
+        ractor_move_opt = opt ? atoi(opt) : 0;
+    }
+    rb_define_singleton_method(rb_cRactor, "__move_opt_level", ractor_s_move_opt_level, 0);
+    rb_define_singleton_method(rb_cRactor, "__refscan_count", ractor_s_refscan_count, 0);
+    rb_define_singleton_method(rb_cRactor, "__refscan_locked_count", ractor_s_refscan_locked_count, 0);
+    rb_define_singleton_method(rb_cRactor, "__refscan_reset", ractor_s_refscan_reset, 0);
 
     rb_eRactorError          = rb_define_class_under(rb_cRactor, "Error", rb_eRuntimeError);
     rb_eRactorIsolationError = rb_define_class_under(rb_cRactor, "IsolationError", rb_eRactorError);
@@ -1748,6 +1786,25 @@ obj_traverse_replace_rec(struct obj_traverse_replace_data *data)
     return data->rec;
 }
 
+// === Ractor move-opt ablation knobs (RACTOR_MOVE_OPT env, read once at init) ===
+//
+// 0 = baseline: the original per-leaf shareable-refs scan, unchanged.
+// 1 = + infer from dmark == NULL: a T_DATA whose type marks no Ruby refs holds
+//     none, so it is trivially shareable-ref-only; skip the scan for it.
+// 2 = + cheapen the scan: hold the single NO_BARRIER VM lock ourselves and run
+//     the no-relock reachability walk (rb_objspace_reachable_objects_from_locked),
+//     dropping the reentrant RB_VM_LOCKING re-acquire the plain scan pays per leaf.
+// 3 = + flag: a type that sets RUBY_TYPED_ONLY_SHAREABLE_REFS asserts every ref
+//     it holds is permanently shareable; trust it and skip the scan entirely.
+//
+// All four levels are compiled into one binary; the env var only selects which
+// gate runs, so YJIT codegen is identical across runs. The two counters below
+// are pre-flight instrumentation: they prove at runtime that the patched binary
+// is live and which scan path actually executed for a given level.
+static int ractor_move_opt = 0;
+static size_t ractor_refscan_count = 0;        // plain (relocking) scans run
+static size_t ractor_refscan_locked_count = 0; // cheapened (no-relock) scans run
+
 static void
 obj_refer_only_shareables_p_i(VALUE obj, void *ptr)
 {
@@ -1762,10 +1819,48 @@ static int
 obj_refer_only_shareables_p(VALUE obj)
 {
     int cnt = 0;
+    ractor_refscan_count++;
     RB_VM_LOCKING_NO_BARRIER() {
         rb_objspace_reachable_objects_from(obj, obj_refer_only_shareables_p_i, &cnt);
     }
     return cnt == 0;
+}
+
+// Level 2: same answer as obj_refer_only_shareables_p, but takes the single
+// NO_BARRIER VM lock here and runs the no-relock reachability walk, so each leaf
+// pays one lock acquire instead of the plain scan's acquire + reentrant
+// re-acquire inside rb_objspace_reachable_objects_from.
+static int
+obj_refer_only_shareables_p_locked(VALUE obj)
+{
+    int cnt = 0;
+    ractor_refscan_locked_count++;
+    RB_VM_LOCKING_NO_BARRIER() {
+        rb_objspace_reachable_objects_from_locked(obj, obj_refer_only_shareables_p_i, &cnt);
+    }
+    return cnt == 0;
+}
+
+// Level-gated replacement for the bare obj_refer_only_shareables_p call in the
+// T_DATA move/copy gate. Cumulative: higher levels add cheaper short-circuits in
+// front of the baseline scan.
+static int
+obj_data_refs_ok_p(VALUE obj)
+{
+    if (ractor_move_opt >= 3 && RTYPEDDATA_P(obj) &&
+        (RTYPEDDATA_TYPE(obj)->flags & RUBY_TYPED_ONLY_SHAREABLE_REFS)) {
+        // The type asserts all its refs are permanently shareable; trust it.
+        return 1;
+    }
+    if (ractor_move_opt >= 1 && RTYPEDDATA_P(obj) &&
+        RTYPEDDATA_TYPE(obj)->function.dmark == NULL) {
+        // Marks no Ruby refs, so holds none: trivially shareable-ref-only.
+        return 1;
+    }
+    if (ractor_move_opt >= 2) {
+        return obj_refer_only_shareables_p_locked(obj);
+    }
+    return obj_refer_only_shareables_p(obj);
 }
 
 static int
@@ -1959,7 +2054,7 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
         // single ractor by exclusive ownership. Embedded data (Time) is duplicated
         // by the memcpy; pointer-backed data (BigDecimal) transfers ownership, and
         // the tombstoned original never runs dfree, so its C struct is freed once.
-        if (obj_refer_only_shareables_p(obj) &&
+        if (obj_data_refs_ok_p(obj) &&
             (!data->move || allow_frozen_shareable_p(obj))) {
             break;
         }

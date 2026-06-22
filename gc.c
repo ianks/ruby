@@ -4792,6 +4792,31 @@ rb_objspace_reachable_objects_from(VALUE obj, void (func)(VALUE, void *), void *
     }
 }
 
+/* Same as rb_objspace_reachable_objects_from, but assumes the caller already
+ * holds the VM lock and does NOT re-acquire it. Used by the Ractor move/copy
+ * T_DATA gate, which already runs the scan inside RB_VM_LOCKING_NO_BARRIER, so
+ * the reentrant re-acquire above is pure overhead per leaf. */
+void
+rb_objspace_reachable_objects_from_locked(VALUE obj, void (func)(VALUE, void *), void *data)
+{
+    ASSERT_vm_locking();
+
+    if (rb_gc_impl_during_gc_p(rb_gc_get_objspace())) rb_bug("rb_objspace_reachable_objects_from_locked() is not supported while during GC");
+
+    if (!RB_SPECIAL_CONST_P(obj)) {
+        rb_vm_t *vm = GET_VM();
+        struct gc_mark_func_data_struct *prev_mfd = vm->gc.mark_func_data;
+        struct gc_mark_func_data_struct mfd = {
+            .mark_func = func,
+            .data = data,
+        };
+
+        vm->gc.mark_func_data = &mfd;
+        rb_gc_mark_children(rb_gc_get_objspace(), obj);
+        vm->gc.mark_func_data = prev_mfd;
+    }
+}
+
 struct root_objects_data {
     const char *category;
     void (*func)(const char *category, VALUE, void *);
