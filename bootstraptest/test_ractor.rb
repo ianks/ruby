@@ -2085,6 +2085,49 @@ assert_equal 'ok', %q{
   roundtripped_obj == obj ? :ok : roundtripped_obj
 }
 
+# move preserves aliasing: one object reachable through many references must
+# come back as the SAME single object, not a live first reference plus
+# Ractor::MovedObject tombstones for the rest.
+assert_equal 'ok', %q{
+  ractor = Ractor.new do
+    obj  = Ractor.receive
+    refs = [obj[:a], obj[:b], obj[:arr][0], obj[:arr][1], obj[:nested][:deep]]
+    moved = refs.any? { |x| Ractor::MovedObject === x }
+    aliased = refs.all? { |x| x.equal?(refs[0]) }
+    !moved && aliased ? :ok : [moved, aliased]
+  end
+  shared = "shared-leaf".dup
+  ractor.send({ a: shared, b: shared, arr: [shared, shared], nested: { deep: shared } }, move: true)
+  ractor.value
+}
+
+# move preserves aliasing for the minimal [x, x] case
+assert_equal 'ok', %q{
+  ractor = Ractor.new do
+    a, b = Ractor.receive
+    moved = (Ractor::MovedObject === a) || (Ractor::MovedObject === b)
+    !moved && a.equal?(b) ? :ok : [moved, a.equal?(b)]
+  end
+  x = "x".dup
+  ractor.send([x, x], move: true)
+  ractor.value
+}
+
+# move preserves aliasing while keeping a non-aliased sibling distinct
+assert_equal 'ok', %q{
+  ractor = Ractor.new do
+    obj = Ractor.receive
+    s0, s1 = obj[:list][0][:v], obj[:list][1][:v]
+    other  = obj[:other]
+    moved = [s0, s1, other].any? { |x| Ractor::MovedObject === x }
+    !moved && s0.equal?(s1) && !other.equal?(s0) ? :ok : [moved, s0.equal?(s1), other.equal?(s0)]
+  end
+  s = "S".dup
+  u = "U".dup
+  ractor.send({ list: [{ v: s }, { v: s }], other: u }, move: true)
+  ractor.value
+}
+
 # moved arrays can't be used
 assert_equal 'ok', %q{
   ractor = Ractor.new { Ractor.receive }
