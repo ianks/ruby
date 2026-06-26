@@ -4,17 +4,10 @@
 #include "vm_debug.h"
 #include "debug_counter.h"
 
-#if USE_RUBY_DEBUG_LOG
 #define LOCATION_ARGS const char *file, int line
 #define LOCATION_PARAMS file, line
 #define APPEND_LOCATION_ARGS , const char *file, int line
 #define APPEND_LOCATION_PARAMS , file, line
-#else
-#define LOCATION_ARGS void
-#define LOCATION_PARAMS
-#define APPEND_LOCATION_ARGS
-#define APPEND_LOCATION_PARAMS
-#endif
 
 bool rb_vm_locked_p(void);
 void rb_vm_lock_body(LOCATION_ARGS);

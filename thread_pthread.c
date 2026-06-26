@@ -13,6 +13,7 @@
 
 #include "internal/gc.h"
 #include "internal/sanitizers.h"
+#include "hrtime.h"
 
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
@@ -1470,6 +1471,14 @@ rb_ractor_sched_barrier_start(rb_vm_t *vm, rb_ractor_t *cr)
 
     RUBY_DEBUG_LOG("start serial:%u", vm->ractor.sched.barrier_serial);
 
+    bool ractor_attr = rb_ractor_attribution_enabled();
+    unsigned int attr_serial = vm->ractor.sched.barrier_serial;
+    unsigned int attr_trigger_ractor = (unsigned int)rb_ractor_id(cr);
+    rb_hrtime_t attr_start = ractor_attr ? rb_hrtime_now() : 0;
+    if (ractor_attr) {
+        rb_ractor_attribution_barrier_start(attr_serial, attr_trigger_ractor, vm->ractor.sched.running_cnt, vm->ractor.sched.barrier_waiting_cnt);
+    }
+
     unsigned int lock_rec;
 
     ractor_sched_lock(vm, cr);
@@ -1502,6 +1511,11 @@ rb_ractor_sched_barrier_start(rb_vm_t *vm, rb_ractor_t *cr)
 
         RUBY_DEBUG_LOG("completed seirial:%u", vm->ractor.sched.barrier_serial);
 
+        if (ractor_attr) {
+            rb_hrtime_t attr_end = rb_hrtime_now();
+            rb_ractor_attribution_barrier_start_done(attr_serial, attr_trigger_ractor, (unsigned long long)rb_hrtime_sub(attr_end, attr_start), vm->ractor.sched.running_cnt, vm->ractor.sched.barrier_waiting_cnt);
+        }
+
         // no other ractors are there
         vm->ractor.sched.barrier_serial++;
         vm->ractor.sched.barrier_waiting_cnt = 0;
@@ -1525,6 +1539,10 @@ rb_ractor_sched_barrier_end(rb_vm_t *vm, rb_ractor_t *cr)
     VM_ASSERT(vm->ractor.sched.barrier_waiting);
     VM_ASSERT(vm->ractor.sched.barrier_ractor);
     VM_ASSERT(vm->ractor.sched.barrier_lock_rec > 0);
+
+    if (rb_ractor_attribution_enabled()) {
+        rb_ractor_attribution_barrier_end((unsigned int)vm->ractor.sched.barrier_serial - 1, (unsigned int)rb_ractor_id(vm->ractor.sched.barrier_ractor));
+    }
 
     vm->ractor.sched.barrier_waiting = false;
     vm->ractor.sched.barrier_ractor = NULL;
@@ -1568,9 +1586,10 @@ rb_ractor_sched_barrier_join(rb_vm_t *vm, rb_ractor_t *cr)
     VM_ASSERT(vm->ractor.sync.lock_owner == NULL); // VM is locked, but owner == NULL
     VM_ASSERT(vm->ractor.sched.barrier_waiting);  // VM needs barrier sync
 
-#if USE_RUBY_DEBUG_LOG || VM_CHECK_MODE > 0
     unsigned int barrier_serial = vm->ractor.sched.barrier_serial;
-#endif
+    bool ractor_attr = rb_ractor_attribution_enabled();
+    rb_hrtime_t attr_join_start = 0;
+    unsigned long long attr_join_wait = 0;
 
     RUBY_DEBUG_LOG("join");
 
@@ -1586,9 +1605,17 @@ rb_ractor_sched_barrier_join(rb_vm_t *vm, rb_ractor_t *cr)
             RUBY_DEBUG_LOG("waiting_cnt:%u serial:%u", vm->ractor.sched.barrier_waiting_cnt, barrier_serial);
 
             ractor_sched_barrier_join_signal_locked(vm);
+            attr_join_start = ractor_attr ? rb_hrtime_now() : 0;
             ractor_sched_barrier_join_wait_locked(vm, cr->threads.sched.running);
+            if (ractor_attr) {
+                attr_join_wait = (unsigned long long)rb_hrtime_sub(rb_hrtime_now(), attr_join_start);
+            }
         }
         ractor_sched_unlock(vm, cr);
+    }
+
+    if (ractor_attr) {
+        rb_ractor_attribution_barrier_join(barrier_serial, (unsigned int)rb_ractor_id(cr), attr_join_wait);
     }
 
     rb_native_mutex_lock(&vm->ractor.sync.lock);

@@ -1,5 +1,6 @@
 #include "internal/gc.h"
 #include "internal/thread.h"
+#include "hrtime.h"
 #include "vm_core.h"
 #include "vm_sync.h"
 #include "ractor_core.h"
@@ -89,7 +90,12 @@ vm_lock_enter(rb_ractor_t *cr, rb_vm_t *vm, bool locked, bool no_barrier, unsign
         VM_ASSERT(cr->sync.locked_by != rb_ractor_self(cr));
 #endif
         // lock
+        bool ractor_attr = rb_ractor_attribution_enabled();
+        rb_hrtime_t attr_lock_start = ractor_attr ? rb_hrtime_now() : 0;
         rb_native_mutex_lock(&vm->ractor.sync.lock);
+        if (ractor_attr) {
+            rb_ractor_attribution_vm_lock_wait((unsigned int)rb_ractor_id(cr), file, line, (unsigned long long)rb_hrtime_sub(rb_hrtime_now(), attr_lock_start), vm_need_barrier_waiting(vm));
+        }
         VM_ASSERT(vm->ractor.sync.lock_owner == NULL);
         VM_ASSERT(vm->ractor.sync.lock_rec == 0);
 

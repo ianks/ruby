@@ -592,6 +592,104 @@ static const char *obj_type_name(VALUE obj);
 static st_table *id2ref_tbl;
 #include "gc/default/default.c"
 
+void
+rb_gc_ractor_move_page_adoption_start(void)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_move_page_adoption_start();
+#endif
+}
+
+void
+rb_gc_ractor_move_page_adoption_finish(void)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_move_page_adoption_finish();
+#endif
+}
+
+void
+rb_gc_ractor_move_bulk_alloc_start(void)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_move_bulk_alloc_start();
+#endif
+}
+
+void
+rb_gc_ractor_move_bulk_alloc_finish(void)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_move_bulk_alloc_finish();
+#endif
+}
+
+bool
+rb_ractor_attribution_enabled(void)
+{
+#if !USE_MODULAR_GC
+    return gc_ractor_attribution_enabled();
+#else
+    return false;
+#endif
+}
+
+void
+rb_ractor_attribution_barrier_start(unsigned int serial, unsigned int trigger_ractor, unsigned int running_cnt, unsigned int waiting_cnt)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_barrier_start(serial, trigger_ractor, running_cnt, waiting_cnt);
+#endif
+}
+
+void
+rb_ractor_attribution_barrier_start_done(unsigned int serial, unsigned int trigger_ractor, unsigned long long wait_ns, unsigned int running_cnt, unsigned int waiting_cnt)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_barrier_start_done(serial, trigger_ractor, wait_ns, running_cnt, waiting_cnt);
+#endif
+}
+
+void
+rb_ractor_attribution_barrier_join(unsigned int serial, unsigned int join_ractor, unsigned long long wait_ns)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_barrier_join(serial, join_ractor, wait_ns);
+#endif
+}
+
+void
+rb_ractor_attribution_barrier_end(unsigned int serial, unsigned int trigger_ractor)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_barrier_end(serial, trigger_ractor);
+#endif
+}
+
+void
+rb_ractor_attribution_vm_lock_wait(unsigned int ractor_id, const char *file, int line, unsigned long long wait_ns, bool barrier_waiting)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_vm_lock_wait(ractor_id, file, line, wait_ns, barrier_waiting);
+#endif
+}
+
+void
+rb_ractor_attribution_print_summary(void)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_print_summary();
+#endif
+}
+
+void
+rb_ractor_attribution_set_phase(const char *phase)
+{
+#if !USE_MODULAR_GC
+    gc_ractor_attribution_set_phase(phase);
+#endif
+}
+
 #if USE_MODULAR_GC && !defined(HAVE_DLOPEN)
 # error "Modular GC requires dlopen"
 #elif USE_MODULAR_GC

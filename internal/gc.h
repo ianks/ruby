@@ -245,6 +245,18 @@ VALUE rb_gc_disable_no_rest(void);
 /* gc.c (export) */
 const char *rb_objspace_data_type_name(VALUE obj);
 VALUE rb_newobj(struct rb_execution_context_struct *, VALUE, VALUE, uint32_t /* shape_id_t */, bool, size_t);
+void rb_gc_ractor_move_page_adoption_start(void);
+void rb_gc_ractor_move_page_adoption_finish(void);
+void rb_gc_ractor_move_bulk_alloc_start(void);
+void rb_gc_ractor_move_bulk_alloc_finish(void);
+bool rb_ractor_attribution_enabled(void);
+void rb_ractor_attribution_barrier_start(unsigned int serial, unsigned int trigger_ractor, unsigned int running_cnt, unsigned int waiting_cnt);
+void rb_ractor_attribution_barrier_start_done(unsigned int serial, unsigned int trigger_ractor, unsigned long long wait_ns, unsigned int running_cnt, unsigned int waiting_cnt);
+void rb_ractor_attribution_barrier_join(unsigned int serial, unsigned int join_ractor, unsigned long long wait_ns);
+void rb_ractor_attribution_barrier_end(unsigned int serial, unsigned int trigger_ractor);
+void rb_ractor_attribution_vm_lock_wait(unsigned int ractor_id, const char *file, int line, unsigned long long wait_ns, bool barrier_waiting);
+void rb_ractor_attribution_print_summary(void);
+void rb_ractor_attribution_set_phase(const char *phase);
 VALUE rb_newobj_of(VALUE, VALUE, size_t);
 VALUE rb_ec_newobj_of(struct rb_execution_context_struct *, VALUE, VALUE, size_t);
 size_t rb_obj_memsize_of(VALUE);

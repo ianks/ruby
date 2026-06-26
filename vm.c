@@ -3458,6 +3458,8 @@ ruby_vm_destruct(rb_vm_t *vm)
 
         struct rb_objspace *objspace = vm->gc.objspace;
 
+        rb_ractor_attribution_print_summary();
+
         rb_vm_living_threads_init(vm);
         ruby_vm_run_at_exit_hooks(vm);
         st_free_embedded_table(&vm->ci_table);

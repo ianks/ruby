@@ -1038,6 +1038,26 @@ ractor_moved_missing(int argc, VALUE *argv, VALUE self)
  *
  */
 
+static VALUE
+ractor_attribution_phase_set(VALUE self, VALUE phase)
+{
+    const char *name = NULL;
+    (void)self;
+
+    if (NIL_P(phase)) {
+        name = "none";
+    }
+    else if (SYMBOL_P(phase)) {
+        name = rb_id2name(SYM2ID(phase));
+    }
+    else {
+        name = StringValueCStr(phase);
+    }
+
+    rb_ractor_attribution_set_phase(name);
+    return phase;
+}
+
 void
 Init_Ractor(void)
 {
@@ -1050,6 +1070,8 @@ Init_Ractor(void)
     rb_eRactorMovedError     = rb_define_class_under(rb_cRactor, "MovedError",  rb_eRactorError);
     rb_eRactorClosedError    = rb_define_class_under(rb_cRactor, "ClosedError", rb_eStopIteration);
     rb_eRactorUnsafeError    = rb_define_class_under(rb_cRactor, "UnsafeError", rb_eRactorError);
+
+    rb_define_singleton_method(rb_cRactor, "__attribution_phase=", ractor_attribution_phase_set, 1);
 
     rb_cRactorMovedObject = rb_define_class_under(rb_cRactor, "MovedObject", rb_cBasicObject);
     rb_undef_alloc_func(rb_cRactorMovedObject);
@@ -2078,9 +2100,25 @@ move_leave(VALUE obj, struct obj_traverse_replace_data *data)
 }
 
 static VALUE
+ractor_move_body(VALUE obj)
+{
+    return rb_obj_traverse_replace(obj, move_enter, move_leave, true);
+}
+
+static VALUE
+ractor_move_ensure(VALUE _)
+{
+    rb_gc_ractor_move_page_adoption_finish();
+    rb_gc_ractor_move_bulk_alloc_finish();
+    return Qnil;
+}
+
+static VALUE
 ractor_move(VALUE obj)
 {
-    VALUE val = rb_obj_traverse_replace(obj, move_enter, move_leave, true);
+    rb_gc_ractor_move_bulk_alloc_start();
+    rb_gc_ractor_move_page_adoption_start();
+    VALUE val = rb_ensure(ractor_move_body, obj, ractor_move_ensure, Qnil);
     if (!UNDEF_P(val)) {
         return val;
     }

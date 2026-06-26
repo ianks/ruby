@@ -200,6 +200,8 @@ typedef struct ractor_newobj_heap_cache {
     uintptr_t cursor_end;
     struct free_region *next_region;
     struct heap_page *using_page;
+    struct heap_page *refill_pages;
+    size_t refill_pages_count;
     size_t allocated_objects_count;
 } rb_ractor_newobj_heap_cache_t;
 
@@ -2222,6 +2224,649 @@ heap_page_allocate_and_initialize_force(rb_objspace_t *objspace, rb_heap_t *heap
     objspace->heap_pages.allocatable_bytes = prev_allocatable_bytes;
 }
 
+#define RACTOR_MOVE_BULK_ALLOC_DEFAULT_MAX_PAGES 1024
+#define RACTOR_MOVE_BULK_ALLOC_DEFAULT_MARK_STEP 50000
+
+static int ractor_move_page_adoption_enabled = -1;
+static int ractor_move_bulk_alloc_enabled = -1;
+static int ractor_move_bulk_alloc_stats_enabled = -1;
+static int ractor_phase_bulk_alloc_enabled = -1;
+static int ractor_attribution_enabled = -1;
+static int ractor_attribution_alloc_enabled = -1;
+static bool ractor_move_bulk_alloc_max_pages_initialized = false;
+static bool ractor_move_bulk_alloc_mark_step_initialized = false;
+static bool ractor_phase_bulk_alloc_prepare_pages_initialized = false;
+static bool ractor_phase_bulk_refill_pages_initialized = false;
+static size_t ractor_move_bulk_alloc_max_pages;
+static size_t ractor_move_bulk_alloc_mark_step;
+static size_t ractor_phase_bulk_alloc_prepare_pages;
+static size_t ractor_phase_bulk_refill_pages;
+
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER unsigned int ractor_move_page_adoption_depth;
+static RB_THREAD_LOCAL_SPECIFIER unsigned int ractor_move_bulk_alloc_depth;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_objects;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_cache_misses;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_forced_pages;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_gc_continue;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_gc_start;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_gc_rest_preflight;
+static RB_THREAD_LOCAL_SPECIFIER size_t ractor_move_bulk_alloc_cap_exceeded;
+#else
+static unsigned int ractor_move_page_adoption_depth;
+static unsigned int ractor_move_bulk_alloc_depth;
+static size_t ractor_move_bulk_alloc_objects;
+static size_t ractor_move_bulk_alloc_cache_misses;
+static size_t ractor_move_bulk_alloc_forced_pages;
+static size_t ractor_move_bulk_alloc_gc_continue;
+static size_t ractor_move_bulk_alloc_gc_start;
+static size_t ractor_move_bulk_alloc_gc_rest_preflight;
+static size_t ractor_move_bulk_alloc_cap_exceeded;
+#endif
+
+static bool
+gc_env_enabled(const char *name, int *cache)
+{
+    if (*cache < 0) {
+        const char *enabled = getenv(name);
+        *cache = enabled && enabled[0] && enabled[0] != '0';
+    }
+    return *cache;
+}
+
+static size_t
+gc_env_size(const char *name, size_t default_value)
+{
+    const char *value = getenv(name);
+    if (!value || !value[0]) return default_value;
+
+    char *end = NULL;
+    unsigned long long result = strtoull(value, &end, 10);
+    if (end == value) return default_value;
+
+    return (size_t)result;
+}
+
+static bool
+gc_ractor_move_page_adoption_enabled(void)
+{
+    return gc_env_enabled("RACTOR_MOVE_PAGE_ADOPTION", &ractor_move_page_adoption_enabled);
+}
+
+static bool
+gc_ractor_move_bulk_alloc_enabled(void)
+{
+    return gc_env_enabled("RACTOR_MOVE_BULK_ALLOC", &ractor_move_bulk_alloc_enabled);
+}
+
+static bool
+gc_ractor_move_bulk_alloc_stats_enabled(void)
+{
+    return gc_env_enabled("RACTOR_MOVE_BULK_ALLOC_STATS", &ractor_move_bulk_alloc_stats_enabled);
+}
+
+static bool
+gc_ractor_phase_bulk_alloc_enabled(void)
+{
+    return gc_env_enabled("RACTOR_PHASE_BULK_ALLOC", &ractor_phase_bulk_alloc_enabled);
+}
+
+static bool
+gc_ractor_attribution_enabled(void)
+{
+    return gc_env_enabled("RACTOR_ATTRIBUTION", &ractor_attribution_enabled);
+}
+
+static bool
+gc_ractor_attribution_alloc_enabled(void)
+{
+    return gc_env_enabled("RACTOR_ATTRIBUTION_ALLOC", &ractor_attribution_alloc_enabled);
+}
+
+static size_t
+gc_ractor_move_bulk_alloc_max_pages(void)
+{
+    if (!ractor_move_bulk_alloc_max_pages_initialized) {
+        ractor_move_bulk_alloc_max_pages = gc_env_size("RACTOR_MOVE_BULK_ALLOC_MAX_PAGES", RACTOR_MOVE_BULK_ALLOC_DEFAULT_MAX_PAGES);
+        ractor_move_bulk_alloc_max_pages_initialized = true;
+    }
+    return ractor_move_bulk_alloc_max_pages;
+}
+
+static size_t
+gc_ractor_move_bulk_alloc_mark_step(void)
+{
+    if (!ractor_move_bulk_alloc_mark_step_initialized) {
+        ractor_move_bulk_alloc_mark_step = gc_env_size("RACTOR_MOVE_BULK_ALLOC_MARK_STEP", RACTOR_MOVE_BULK_ALLOC_DEFAULT_MARK_STEP);
+        ractor_move_bulk_alloc_mark_step_initialized = true;
+    }
+    return ractor_move_bulk_alloc_mark_step;
+}
+
+static size_t
+gc_ractor_phase_bulk_alloc_prepare_pages(void)
+{
+    if (!ractor_phase_bulk_alloc_prepare_pages_initialized) {
+        ractor_phase_bulk_alloc_prepare_pages = gc_env_size("RACTOR_PHASE_BULK_ALLOC_PREPARE_PAGES", 0);
+        ractor_phase_bulk_alloc_prepare_pages_initialized = true;
+    }
+    return ractor_phase_bulk_alloc_prepare_pages;
+}
+
+static size_t
+gc_ractor_phase_bulk_refill_pages(void)
+{
+    if (!ractor_phase_bulk_refill_pages_initialized) {
+        ractor_phase_bulk_refill_pages = gc_env_size("RACTOR_PHASE_BULK_REFILL_PAGES", 0);
+        ractor_phase_bulk_refill_pages_initialized = true;
+    }
+    return ractor_phase_bulk_refill_pages;
+}
+
+static void
+gc_ractor_move_page_adoption_start(void)
+{
+    if (gc_ractor_move_page_adoption_enabled()) {
+        ractor_move_page_adoption_depth++;
+    }
+}
+
+static void
+gc_ractor_move_page_adoption_finish(void)
+{
+    if (ractor_move_page_adoption_depth > 0) {
+        ractor_move_page_adoption_depth--;
+    }
+}
+
+static bool
+gc_ractor_move_page_adoption_active(void)
+{
+    return ractor_move_page_adoption_depth > 0;
+}
+
+static bool
+gc_ractor_move_bulk_alloc_active(void)
+{
+    return ractor_move_bulk_alloc_depth > 0;
+}
+
+static void
+gc_ractor_move_bulk_alloc_stats_reset(void)
+{
+    ractor_move_bulk_alloc_objects = 0;
+    ractor_move_bulk_alloc_cache_misses = 0;
+    ractor_move_bulk_alloc_forced_pages = 0;
+    ractor_move_bulk_alloc_gc_continue = 0;
+    ractor_move_bulk_alloc_gc_start = 0;
+    ractor_move_bulk_alloc_gc_rest_preflight = 0;
+    ractor_move_bulk_alloc_cap_exceeded = 0;
+}
+
+static void
+gc_ractor_move_bulk_alloc_stats_print(void)
+{
+    if (!gc_ractor_move_bulk_alloc_stats_enabled()) return;
+
+    fprintf(stderr,
+            "ractor_move_bulk_alloc: objects=%zu cache_misses=%zu forced_pages=%zu "
+            "gc_continue=%zu gc_start=%zu gc_rest_preflight=%zu cap_exceeded=%zu\n",
+            ractor_move_bulk_alloc_objects,
+            ractor_move_bulk_alloc_cache_misses,
+            ractor_move_bulk_alloc_forced_pages,
+            ractor_move_bulk_alloc_gc_continue,
+            ractor_move_bulk_alloc_gc_start,
+            ractor_move_bulk_alloc_gc_rest_preflight,
+            ractor_move_bulk_alloc_cap_exceeded);
+}
+
+static void
+gc_ractor_move_bulk_alloc_record_newobj(void)
+{
+    if (gc_ractor_move_bulk_alloc_active()) {
+        ractor_move_bulk_alloc_objects++;
+    }
+}
+
+enum ractor_attribution_bulk_state {
+    RACTOR_ATTR_BULK_OFF = 0,
+    RACTOR_ATTR_BULK_ON = 1,
+    RACTOR_ATTR_BULK_COUNT = 2,
+};
+
+enum ractor_attribution_phase {
+    RACTOR_ATTR_PHASE_NONE = 0,
+    RACTOR_ATTR_PHASE_DISPATCH_SEND,
+    RACTOR_ATTR_PHASE_JSON_PARSE,
+    RACTOR_ATTR_PHASE_DECODE_ONLY_RESULT_SEND,
+    RACTOR_ATTR_PHASE_COPY_RESULT_SEND,
+    RACTOR_ATTR_PHASE_MOVE_RESULT_SEND,
+    RACTOR_ATTR_PHASE_RECEIVE_CONSUME,
+    RACTOR_ATTR_PHASE_WORKER_STOP,
+    RACTOR_ATTR_PHASE_COUNT,
+};
+
+struct ractor_attribution_bulk_stats {
+    size_t barrier_start;
+    size_t barrier_start_done;
+    size_t barrier_start_wait_ns;
+    size_t barrier_join;
+    size_t barrier_join_wait_ns;
+    size_t barrier_end;
+    size_t vm_lock_wait;
+    size_t vm_lock_wait_ns;
+    size_t vm_lock_wait_with_barrier;
+    size_t vm_lock_wait_with_barrier_ns;
+    size_t newobj_cache_miss;
+    size_t gc_continue;
+    size_t gc_start;
+};
+
+#define RACTOR_ATTR_VM_LOCK_SITE_MAX 128
+
+struct ractor_attribution_vm_lock_site {
+    const char *file;
+    int line;
+    unsigned int phase;
+    unsigned int bulk;
+    bool barrier_waiting;
+    size_t count;
+    size_t wait_ns;
+    size_t max_wait_ns;
+};
+
+static struct ractor_attribution_bulk_stats ractor_attribution_stats[RACTOR_ATTR_PHASE_COUNT][RACTOR_ATTR_BULK_COUNT];
+static struct ractor_attribution_vm_lock_site ractor_attribution_vm_lock_sites[RACTOR_ATTR_VM_LOCK_SITE_MAX];
+static size_t ractor_attribution_vm_lock_site_overflow_count;
+static size_t ractor_attribution_vm_lock_site_overflow_wait_ns;
+
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER enum ractor_attribution_phase ractor_attribution_phase;
+#else
+static enum ractor_attribution_phase ractor_attribution_phase;
+#endif
+
+static const char *
+gc_ractor_attribution_phase_name(enum ractor_attribution_phase phase)
+{
+    switch (phase) {
+      case RACTOR_ATTR_PHASE_NONE: return "none";
+      case RACTOR_ATTR_PHASE_DISPATCH_SEND: return "dispatch_send";
+      case RACTOR_ATTR_PHASE_JSON_PARSE: return "json_parse";
+      case RACTOR_ATTR_PHASE_DECODE_ONLY_RESULT_SEND: return "decode_only_result_send";
+      case RACTOR_ATTR_PHASE_COPY_RESULT_SEND: return "copy_result_send";
+      case RACTOR_ATTR_PHASE_MOVE_RESULT_SEND: return "move_result_send";
+      case RACTOR_ATTR_PHASE_RECEIVE_CONSUME: return "receive_consume";
+      case RACTOR_ATTR_PHASE_WORKER_STOP: return "worker_stop";
+      case RACTOR_ATTR_PHASE_COUNT: break;
+    }
+    return "unknown";
+}
+
+static bool
+gc_ractor_phase_bulk_alloc_active(void)
+{
+    if (!gc_ractor_phase_bulk_alloc_enabled()) return false;
+    if (ractor_attribution_phase == RACTOR_ATTR_PHASE_NONE) return false;
+
+    const char *phases = getenv("RACTOR_PHASE_BULK_ALLOC_PHASES");
+    if (!phases || !phases[0]) {
+        return ractor_attribution_phase == RACTOR_ATTR_PHASE_JSON_PARSE;
+    }
+
+    return strstr(phases, gc_ractor_attribution_phase_name(ractor_attribution_phase)) != NULL;
+}
+
+static bool
+gc_ractor_bulk_alloc_active(void)
+{
+    return gc_ractor_move_bulk_alloc_active() || gc_ractor_phase_bulk_alloc_active();
+}
+
+static enum ractor_attribution_bulk_state
+gc_ractor_attribution_bulk_state(void)
+{
+    return gc_ractor_bulk_alloc_active() ? RACTOR_ATTR_BULK_ON : RACTOR_ATTR_BULK_OFF;
+}
+
+static struct ractor_attribution_bulk_stats *
+gc_ractor_attribution_current_stats(void)
+{
+    return &ractor_attribution_stats[ractor_attribution_phase][gc_ractor_attribution_bulk_state()];
+}
+
+static void
+gc_ractor_attribution_add(size_t *counter, size_t value)
+{
+    RUBY_ATOMIC_SIZE_ADD(*counter, value);
+}
+
+static void
+gc_ractor_move_bulk_alloc_record_cache_miss(size_t heap_idx)
+{
+    (void)heap_idx;
+    if (gc_ractor_attribution_alloc_enabled()) {
+        gc_ractor_attribution_add(&gc_ractor_attribution_current_stats()->newobj_cache_miss, 1);
+    }
+
+    if (gc_ractor_move_bulk_alloc_active()) {
+        ractor_move_bulk_alloc_cache_misses++;
+    }
+}
+
+static void
+gc_ractor_move_bulk_alloc_record_gc_continue(void)
+{
+    if (gc_ractor_attribution_alloc_enabled()) {
+        gc_ractor_attribution_add(&gc_ractor_attribution_current_stats()->gc_continue, 1);
+    }
+
+    if (gc_ractor_move_bulk_alloc_active()) {
+        ractor_move_bulk_alloc_gc_continue++;
+    }
+}
+
+static void
+gc_ractor_move_bulk_alloc_record_gc_start(void)
+{
+    if (gc_ractor_attribution_alloc_enabled()) {
+        gc_ractor_attribution_add(&gc_ractor_attribution_current_stats()->gc_start, 1);
+    }
+
+    if (gc_ractor_move_bulk_alloc_active()) {
+        ractor_move_bulk_alloc_gc_start++;
+    }
+}
+
+static bool
+gc_ractor_move_bulk_alloc_prepare_heap(rb_objspace_t *objspace, rb_heap_t *heap)
+{
+    if (!gc_ractor_bulk_alloc_active()) return false;
+    if (during_gc || ruby_gc_stressful) return false;
+    if (is_incremental_marking(objspace) || needs_continue_sweeping(objspace, heap)) return false;
+
+    if (ractor_move_bulk_alloc_forced_pages >= gc_ractor_move_bulk_alloc_max_pages()) {
+        ractor_move_bulk_alloc_cap_exceeded++;
+        return false;
+    }
+
+    heap_page_allocate_and_initialize_force(objspace, heap);
+    ractor_move_bulk_alloc_forced_pages++;
+    GC_ASSERT(heap->free_pages != NULL);
+    return true;
+}
+
+static size_t
+gc_ractor_move_bulk_alloc_incremental_mark_step_allocations(void)
+{
+    if (gc_ractor_bulk_alloc_active()) {
+        return gc_ractor_move_bulk_alloc_mark_step();
+    }
+    else {
+        return INCREMENTAL_MARK_STEP_ALLOCATIONS;
+    }
+}
+
+static void
+gc_ractor_move_bulk_alloc_start(void)
+{
+    if (!gc_ractor_move_bulk_alloc_enabled()) return;
+
+    bool preflight_rest = false;
+
+    if (ractor_move_bulk_alloc_depth == 0) {
+        rb_objspace_t *objspace = rb_gc_get_objspace();
+        if (is_incremental_marking(objspace) || is_lazy_sweeping(objspace)) {
+            gc_rest(objspace);
+            preflight_rest = true;
+        }
+
+        gc_ractor_move_bulk_alloc_stats_reset();
+        if (preflight_rest) {
+            ractor_move_bulk_alloc_gc_rest_preflight++;
+        }
+    }
+
+    ractor_move_bulk_alloc_depth++;
+}
+
+static void
+gc_ractor_move_bulk_alloc_finish(void)
+{
+    if (ractor_move_bulk_alloc_depth > 0) {
+        ractor_move_bulk_alloc_depth--;
+        if (ractor_move_bulk_alloc_depth == 0) {
+            gc_ractor_move_bulk_alloc_stats_print();
+        }
+    }
+}
+
+static void
+gc_ractor_attribution_barrier_start(unsigned int serial, unsigned int trigger_ractor, unsigned int running_cnt, unsigned int waiting_cnt)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    (void)serial;
+    (void)trigger_ractor;
+    (void)running_cnt;
+    (void)waiting_cnt;
+    gc_ractor_attribution_add(&gc_ractor_attribution_current_stats()->barrier_start, 1);
+}
+
+static void
+gc_ractor_attribution_barrier_start_done(unsigned int serial, unsigned int trigger_ractor, unsigned long long wait_ns, unsigned int running_cnt, unsigned int waiting_cnt)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    (void)serial;
+    (void)trigger_ractor;
+    (void)running_cnt;
+    (void)waiting_cnt;
+    struct ractor_attribution_bulk_stats *stats = gc_ractor_attribution_current_stats();
+    gc_ractor_attribution_add(&stats->barrier_start_done, 1);
+    gc_ractor_attribution_add(&stats->barrier_start_wait_ns, (size_t)wait_ns);
+}
+
+static void
+gc_ractor_attribution_barrier_join(unsigned int serial, unsigned int join_ractor, unsigned long long wait_ns)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    (void)serial;
+    (void)join_ractor;
+    struct ractor_attribution_bulk_stats *stats = gc_ractor_attribution_current_stats();
+    gc_ractor_attribution_add(&stats->barrier_join, 1);
+    gc_ractor_attribution_add(&stats->barrier_join_wait_ns, (size_t)wait_ns);
+}
+
+static void
+gc_ractor_attribution_barrier_end(unsigned int serial, unsigned int trigger_ractor)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    (void)serial;
+    (void)trigger_ractor;
+    gc_ractor_attribution_add(&gc_ractor_attribution_current_stats()->barrier_end, 1);
+}
+
+static void
+gc_ractor_attribution_record_vm_lock_site(const char *file, int line, size_t wait_ns, bool barrier_waiting)
+{
+    enum ractor_attribution_phase phase = ractor_attribution_phase;
+    enum ractor_attribution_bulk_state bulk = gc_ractor_attribution_bulk_state();
+
+    for (size_t i = 0; i < RACTOR_ATTR_VM_LOCK_SITE_MAX; i++) {
+        struct ractor_attribution_vm_lock_site *site = &ractor_attribution_vm_lock_sites[i];
+
+        if (site->file == file && site->line == line && site->phase == (unsigned int)phase && site->bulk == (unsigned int)bulk && site->barrier_waiting == barrier_waiting) {
+            gc_ractor_attribution_add(&site->count, 1);
+            gc_ractor_attribution_add(&site->wait_ns, wait_ns);
+            if (wait_ns > site->max_wait_ns) site->max_wait_ns = wait_ns;
+            return;
+        }
+
+        if (site->file == NULL) {
+            site->file = file;
+            site->line = line;
+            site->phase = (unsigned int)phase;
+            site->bulk = (unsigned int)bulk;
+            site->barrier_waiting = barrier_waiting;
+            site->count = 1;
+            site->wait_ns = wait_ns;
+            site->max_wait_ns = wait_ns;
+            return;
+        }
+    }
+
+    gc_ractor_attribution_add(&ractor_attribution_vm_lock_site_overflow_count, 1);
+    gc_ractor_attribution_add(&ractor_attribution_vm_lock_site_overflow_wait_ns, wait_ns);
+}
+
+static void
+gc_ractor_phase_bulk_alloc_prepare(void)
+{
+    size_t prepare_pages = gc_ractor_phase_bulk_alloc_prepare_pages();
+    if (prepare_pages == 0 || !gc_ractor_phase_bulk_alloc_active()) return;
+
+    rb_objspace_t *objspace = rb_gc_get_objspace();
+    if (during_gc || ruby_gc_stressful) return;
+    if (is_incremental_marking(objspace) || is_lazy_sweeping(objspace)) return;
+
+    unsigned int lev = RB_GC_CR_LOCK();
+    {
+        for (size_t heap_idx = 0; heap_idx < HEAP_COUNT; heap_idx++) {
+            rb_heap_t *heap = &heaps[heap_idx];
+            if (is_incremental_marking(objspace) || needs_continue_sweeping(objspace, heap)) continue;
+
+            for (size_t i = 0; i < prepare_pages; i++) {
+                heap_page_allocate_and_initialize_force(objspace, heap);
+            }
+        }
+    }
+    RB_GC_CR_UNLOCK(lev);
+}
+
+static void
+gc_ractor_attribution_vm_lock_wait(unsigned int ractor_id, const char *file, int line, unsigned long long wait_ns, bool barrier_waiting)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    (void)ractor_id;
+    gc_ractor_attribution_record_vm_lock_site(file, line, (size_t)wait_ns, barrier_waiting);
+    struct ractor_attribution_bulk_stats *stats = gc_ractor_attribution_current_stats();
+    gc_ractor_attribution_add(&stats->vm_lock_wait, 1);
+    gc_ractor_attribution_add(&stats->vm_lock_wait_ns, (size_t)wait_ns);
+    if (barrier_waiting) {
+        gc_ractor_attribution_add(&stats->vm_lock_wait_with_barrier, 1);
+        gc_ractor_attribution_add(&stats->vm_lock_wait_with_barrier_ns, (size_t)wait_ns);
+    }
+}
+
+static void
+gc_ractor_attribution_set_phase(const char *phase)
+{
+    if (!phase || strcmp(phase, "none") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_NONE;
+    }
+    else if (strcmp(phase, "dispatch_send") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_DISPATCH_SEND;
+    }
+    else if (strcmp(phase, "json_parse") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_JSON_PARSE;
+    }
+    else if (strcmp(phase, "decode_only_result_send") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_DECODE_ONLY_RESULT_SEND;
+    }
+    else if (strcmp(phase, "copy_result_send") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_COPY_RESULT_SEND;
+    }
+    else if (strcmp(phase, "move_result_send") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_MOVE_RESULT_SEND;
+    }
+    else if (strcmp(phase, "receive_consume") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_RECEIVE_CONSUME;
+    }
+    else if (strcmp(phase, "worker_stop") == 0) {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_WORKER_STOP;
+    }
+    else {
+        ractor_attribution_phase = RACTOR_ATTR_PHASE_NONE;
+    }
+
+    gc_ractor_phase_bulk_alloc_prepare();
+}
+
+static bool
+gc_ractor_attribution_stats_empty(const struct ractor_attribution_bulk_stats *s)
+{
+    return s->barrier_start == 0 &&
+           s->barrier_start_done == 0 &&
+           s->barrier_join == 0 &&
+           s->barrier_end == 0 &&
+           s->vm_lock_wait == 0 &&
+           s->newobj_cache_miss == 0 &&
+           s->gc_continue == 0 &&
+           s->gc_start == 0;
+}
+
+static void
+gc_ractor_attribution_print_summary(void)
+{
+    if (!gc_ractor_attribution_enabled()) return;
+
+    fprintf(stderr, "\n# Ractor attribution summary\n");
+    fprintf(stderr, "| phase | bulk | barrier_start | barrier_start_wait_us | barrier_join | barrier_join_wait_us | barrier_end | vm_lock_wait | vm_lock_wait_us | vm_lock_wait_barrier | vm_lock_wait_barrier_us | cache_miss | gc_continue | gc_start |\n");
+    fprintf(stderr, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for (int phase = 0; phase < RACTOR_ATTR_PHASE_COUNT; phase++) {
+        for (int bulk = 0; bulk < RACTOR_ATTR_BULK_COUNT; bulk++) {
+            struct ractor_attribution_bulk_stats *s = &ractor_attribution_stats[phase][bulk];
+            if (gc_ractor_attribution_stats_empty(s)) continue;
+
+            fprintf(stderr,
+                    "| %s | %d | %zu | %zu | %zu | %zu | %zu | %zu | %zu | %zu | %zu | %zu | %zu | %zu |\n",
+                    gc_ractor_attribution_phase_name((enum ractor_attribution_phase)phase),
+                    bulk,
+                    s->barrier_start,
+                    s->barrier_start_wait_ns / 1000,
+                    s->barrier_join,
+                    s->barrier_join_wait_ns / 1000,
+                    s->barrier_end,
+                    s->vm_lock_wait,
+                    s->vm_lock_wait_ns / 1000,
+                    s->vm_lock_wait_with_barrier,
+                    s->vm_lock_wait_with_barrier_ns / 1000,
+                    s->newobj_cache_miss,
+                    s->gc_continue,
+                    s->gc_start);
+        }
+    }
+
+    fprintf(stderr, "\n# Ractor VM lock wait sites\n");
+    fprintf(stderr, "| phase | bulk | barrier_waiting | file | line | count | wait_us | max_wait_us |\n");
+    fprintf(stderr, "|---|---:|---:|---|---:|---:|---:|---:|\n");
+    for (size_t i = 0; i < RACTOR_ATTR_VM_LOCK_SITE_MAX; i++) {
+        struct ractor_attribution_vm_lock_site *site = &ractor_attribution_vm_lock_sites[i];
+        if (site->file == NULL || site->count == 0) continue;
+
+        fprintf(stderr,
+                "| %s | %u | %u | %s | %d | %zu | %zu | %zu |\n",
+                gc_ractor_attribution_phase_name((enum ractor_attribution_phase)site->phase),
+                site->bulk,
+                site->barrier_waiting ? 1 : 0,
+                site->file,
+                site->line,
+                site->count,
+                site->wait_ns / 1000,
+                site->max_wait_ns / 1000);
+    }
+    if (ractor_attribution_vm_lock_site_overflow_count > 0) {
+        fprintf(stderr,
+                "| overflow | 0 | 0 | overflow | 0 | %zu | %zu | 0 |\n",
+                ractor_attribution_vm_lock_site_overflow_count,
+                ractor_attribution_vm_lock_site_overflow_wait_ns / 1000);
+    }
+}
+
 static void
 gc_continue(rb_objspace_t *objspace, rb_heap_t *heap)
 {
@@ -2229,6 +2874,7 @@ gc_continue(rb_objspace_t *objspace, rb_heap_t *heap)
     bool needs_gc = is_incremental_marking(objspace) || needs_continue_sweeping(objspace, heap);
     if (!needs_gc) return;
 
+    gc_ractor_move_bulk_alloc_record_gc_continue();
     gc_enter(objspace, gc_enter_event_continue, &lock_lev); // takes vm barrier, try to avoid
 
     /* Continue marking if in incremental marking. */
@@ -2257,6 +2903,18 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
         return;
     }
 
+    if (gc_ractor_move_bulk_alloc_prepare_heap(objspace, heap)) {
+        return;
+    }
+
+    if (gc_ractor_move_page_adoption_active() &&
+            !is_incremental_marking(objspace) &&
+            !needs_continue_sweeping(objspace, heap)) {
+        heap_page_allocate_and_initialize_force(objspace, heap);
+        GC_ASSERT(heap->free_pages != NULL);
+        return;
+    }
+
     /* Continue incremental marking or lazy sweeping, if in any of those steps. */
     gc_continue(objspace, heap);
 
@@ -2270,6 +2928,7 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
         GC_ASSERT(objspace->empty_pages_count == 0);
         GC_ASSERT(objspace->heap_pages.allocatable_bytes == 0);
 
+        gc_ractor_move_bulk_alloc_record_gc_start();
         if (gc_start(objspace, GPR_FLAG_NEWOBJ) == FALSE) {
             rb_memerror();
         }
@@ -2291,6 +2950,7 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
                     rb_bug("cannot create a new page after GC");
                 }
                 else { // Major GC is required, which will allow us to create new page
+                    gc_ractor_move_bulk_alloc_record_gc_start();
                     if (gc_start(objspace, GPR_FLAG_NEWOBJ) == FALSE) {
                         rb_memerror();
                     }
@@ -2452,7 +3112,7 @@ ractor_cache_allocate_slot(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *ca
 
     if (RB_UNLIKELY(is_incremental_marking(objspace))) {
         // Not allowed to allocate without running an incremental marking step
-        if (cache->incremental_mark_step_allocated_slots >= INCREMENTAL_MARK_STEP_ALLOCATIONS) {
+        if (cache->incremental_mark_step_allocated_slots >= gc_ractor_move_bulk_alloc_incremental_mark_step_allocations()) {
             return Qfalse;
         }
 
@@ -2489,12 +3149,73 @@ heap_next_free_page(rb_objspace_t *objspace, rb_heap_t *heap)
 
     page = heap->free_pages;
     heap->free_pages = page->free_next;
+    page->free_next = NULL;
 
     GC_ASSERT(page->free_slots != 0);
 
     asan_unlock_freelist(page);
 
     return page;
+}
+
+static struct heap_page *
+ractor_cache_take_refill_page(rb_ractor_newobj_heap_cache_t *heap_cache)
+{
+    struct heap_page *page = heap_cache->refill_pages;
+
+    if (page) {
+        heap_cache->refill_pages = page->free_next;
+        page->free_next = NULL;
+        heap_cache->refill_pages_count--;
+        asan_unlock_freelist(page);
+    }
+
+    return page;
+}
+
+static void
+ractor_cache_push_refill_page(rb_ractor_newobj_heap_cache_t *heap_cache, struct heap_page *page)
+{
+    GC_ASSERT(page->free_slots != 0);
+    GC_ASSERT(page->free_region != NULL);
+
+    page->free_next = heap_cache->refill_pages;
+    heap_cache->refill_pages = page;
+    heap_cache->refill_pages_count++;
+    asan_lock_freelist(page);
+}
+
+static void
+ractor_cache_return_refill_pages(rb_heap_t *heap, rb_ractor_newobj_heap_cache_t *heap_cache)
+{
+    struct heap_page *page = heap_cache->refill_pages;
+
+    while (page) {
+        asan_unlock_freelist(page);
+        struct heap_page *next = page->free_next;
+        heap_add_freepage(heap, page);
+        page = next;
+    }
+
+    heap_cache->refill_pages = NULL;
+    heap_cache->refill_pages_count = 0;
+}
+
+static void
+ractor_cache_stage_refill_pages(rb_objspace_t *objspace, rb_ractor_newobj_heap_cache_t *heap_cache, rb_heap_t *heap)
+{
+    size_t refill_pages = gc_ractor_phase_bulk_refill_pages();
+    if (refill_pages <= 1 || !gc_ractor_phase_bulk_alloc_active()) return;
+
+    for (size_t i = 1; i < refill_pages && heap->free_pages != NULL; i++) {
+        struct heap_page *page = heap->free_pages;
+        heap->free_pages = page->free_next;
+        page->free_next = NULL;
+
+        GC_ASSERT(page->free_slots != 0);
+        asan_unlock_freelist(page);
+        ractor_cache_push_refill_page(heap_cache, page);
+    }
 }
 
 static inline void
@@ -2577,7 +3298,19 @@ static VALUE
 newobj_cache_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *cache, size_t heap_idx, bool vm_locked)
 {
     rb_heap_t *heap = &heaps[heap_idx];
+    rb_ractor_newobj_heap_cache_t *heap_cache = &cache->heap_caches[heap_idx];
     VALUE obj = Qfalse;
+
+    gc_ractor_move_bulk_alloc_record_cache_miss(heap_idx);
+
+    if (!is_incremental_marking(objspace)) {
+        struct heap_page *page = ractor_cache_take_refill_page(heap_cache);
+        if (page) {
+            ractor_cache_set_page(objspace, cache, heap_idx, page);
+            obj = ractor_cache_allocate_slot(objspace, cache, heap_idx);
+            if (obj != Qfalse) return obj;
+        }
+    }
 
     unsigned int lev = 0;
     bool unlock_vm = false;
@@ -2597,9 +3330,16 @@ newobj_cache_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *cache, size
         }
 
         if (obj == Qfalse) {
-            // Get next free page (possibly running GC)
-            struct heap_page *page = heap_next_free_page(objspace, heap);
-            ractor_cache_set_page(objspace, cache, heap_idx, page);
+            struct heap_page *page = ractor_cache_take_refill_page(heap_cache);
+            if (page) {
+                ractor_cache_set_page(objspace, cache, heap_idx, page);
+            }
+            else {
+                // Get next free page (possibly running GC)
+                page = heap_next_free_page(objspace, heap);
+                ractor_cache_set_page(objspace, cache, heap_idx, page);
+                ractor_cache_stage_refill_pages(objspace, heap_cache, heap);
+            }
 
             // Retry allocation after moving to new page
             obj = ractor_cache_allocate_slot(objspace, cache, heap_idx);
@@ -2696,6 +3436,7 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
     }
 
     size_t heap_idx = heap_idx_for_size(alloc_size);
+    gc_ractor_move_bulk_alloc_record_newobj();
 
     rb_ractor_newobj_cache_t *cache = (rb_ractor_newobj_cache_t *)cache_ptr;
 
@@ -4044,10 +4785,14 @@ gc_ractor_newobj_cache_clear(void *c, void *data)
             heap_page_flush_cache_regions(page, cache);
         }
 
+        ractor_cache_return_refill_pages(heap, cache);
+
         cache->using_page = NULL;
         cache->cursor = 0;
         cache->cursor_end = 0;
         cache->next_region = NULL;
+        cache->refill_pages = NULL;
+        cache->refill_pages_count = 0;
     }
 }
 
